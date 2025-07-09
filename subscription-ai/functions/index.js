@@ -34,3 +34,80 @@ exports.testGemini = functions.https.onRequest(async (req, res) => {
     return res.status(500).json({ error: 'Failed to generate content' })
   }
 })
+
+const admin = require('firebase-admin')
+admin.initializeApp()
+
+const { google } = require('googleapis')
+
+// Replace with your OAuth 2.0 Client credentials or load from Secret Manager.
+const CLIENT_ID = 'YOUR_GOOGLE_CLIENT_ID'
+const CLIENT_SECRET = 'YOUR_GOOGLE_CLIENT_SECRET'
+const REDIRECT_URI = 'YOUR_REDIRECT_URI'
+
+// Run daily at 03:00 UTC
+exports.fetchEmails = functions.pubsub
+  .schedule('0 3 * * *')
+  .timeZone('UTC')
+  .onRun(async (context) => {
+    console.log('Running scheduled email fetch job...')
+
+    try {
+      // Example location for refresh tokens: /emailTokens/{uid} -> { refresh_token }
+      const snapshot = await admin.firestore().collection('emailTokens').get()
+      if (snapshot.empty) {
+        console.log('No connected users found.')
+        return null
+      }
+
+      // Iterate over each user with a stored refresh token
+      for (const doc of snapshot.docs) {
+        const { refresh_token } = doc.data()
+        const uid = doc.id
+        if (!refresh_token) continue
+
+        try {
+          const oAuth2Client = new google.auth.OAuth2(
+            CLIENT_ID,
+            CLIENT_SECRET,
+            REDIRECT_URI
+          )
+          oAuth2Client.setCredentials({ refresh_token })
+
+          // Obtain a fresh access token silently
+          const { token } = await oAuth2Client.getAccessToken()
+          oAuth2Client.setCredentials({ access_token: token })
+
+          const gmail = google.gmail({ version: 'v1', auth: oAuth2Client })
+
+          // Query emails from last 24h containing subscription keywords
+          const query =
+            'newer_than:1d (subscription OR receipt OR renewal OR bill)'
+          const msgList = await gmail.users.messages.list({ userId: 'me', q: query, maxResults: 10 })
+
+          const messages = msgList.data.messages || []
+          console.log(`User ${uid} - found ${messages.length} messages`) 
+
+          for (const msg of messages) {
+            const msgData = await gmail.users.messages.get({
+              userId: 'me',
+              id: msg.id,
+              format: 'metadata',
+              metadataHeaders: ['Subject', 'From'],
+            })
+
+            const headers = msgData.data.payload.headers
+            const subjectHeader = headers.find((h) => h.name === 'Subject') || {}
+            const fromHeader = headers.find((h) => h.name === 'From') || {}
+            console.log(`User ${uid} - Email: Subject="${subjectHeader.value}" From="${fromHeader.value}"`)
+          }
+        } catch (userErr) {
+          console.error(`Failed to fetch emails for user ${uid}:`, userErr)
+        }
+      }
+    } catch (err) {
+      console.error('Scheduled function error:', err)
+    }
+
+    return null
+  })
