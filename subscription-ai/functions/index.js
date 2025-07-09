@@ -46,6 +46,8 @@ const CLIENT_SECRET = 'YOUR_GOOGLE_CLIENT_SECRET'
 const REDIRECT_URI = 'YOUR_REDIRECT_URI'
 // Gemini API key placeholder (replace with Secret Manager in prod)
 const GEMINI_API_KEY = 'YOUR_GEMINI_API_KEY'
+// Firestore namespace (same as frontend service)
+const APP_ID = 'ai-subscriptions-8d7fa'
 
 // Run daily at 03:00 UTC
 exports.fetchEmails = functions.pubsub
@@ -154,6 +156,66 @@ exports.fetchEmails = functions.pubsub
               const parsed = gemRes?.response?.text() || ''
 
               console.log(`Gemini parsed response for user ${uid}, msg ${msg.id}:`, parsed)
+
+              // Attempt to extract JSON from Gemini response
+              let jsonText = parsed.trim()
+              if (jsonText.startsWith('```')) {
+                // Remove markdown fences
+                jsonText = jsonText.replace(/^```[a-z]*\n?/i, '').replace(/```$/i, '')
+              }
+
+              let subscriptionObj
+              try {
+                subscriptionObj = JSON.parse(jsonText)
+              } catch (parseErr) {
+                console.error(`Failed to parse Gemini JSON for user ${uid}, msg ${msg.id}:`, parseErr)
+                continue
+              }
+
+              if (!subscriptionObj || !subscriptionObj.serviceName) {
+                console.log(`Gemini response missing serviceName, skipping user ${uid}, msg ${msg.id}`)
+                continue
+              }
+
+              // Normalize fields
+              const normalized = {
+                serviceName: subscriptionObj.serviceName,
+                cost: subscriptionObj.cost != null ? Number(subscriptionObj.cost) : null,
+                billingCycle: subscriptionObj.billingCycle || null,
+                nextPaymentDate: subscriptionObj.nextPaymentDate || null,
+                isTrial: !!subscriptionObj.isTrial,
+                trialEndDate: subscriptionObj.trialEndDate || null,
+                source: 'email',
+              }
+
+              try {
+                const subsCol = admin
+                  .firestore()
+                  .collection(`artifacts/${APP_ID}/users/${uid}/subscriptions`)
+
+                // Find existing subscription by serviceName (case-insensitive)
+                const existingSnap = await subsCol
+                  .where('serviceName', '==', normalized.serviceName)
+                  .limit(1)
+                  .get()
+
+                if (existingSnap.empty) {
+                  await subsCol.add({
+                    ...normalized,
+                    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+                  })
+                  console.log(`User ${uid} - Added new subscription "${normalized.serviceName}" from email`)
+                } else {
+                  const docRef = existingSnap.docs[0].ref
+                  await docRef.update({
+                    ...normalized,
+                    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+                  })
+                  console.log(`User ${uid} - Updated subscription "${normalized.serviceName}" from email`)
+                }
+              } catch (dbErr) {
+                console.error(`Firestore update failed for user ${uid}, msg ${msg.id}:`, dbErr)
+              }
               // TODO: validate JSON, store into Firestore
             } catch (aiErr) {
               console.error(`Gemini parsing failed for user ${uid}, msg ${msg.id}:`, aiErr)
