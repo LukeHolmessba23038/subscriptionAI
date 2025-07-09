@@ -44,6 +44,8 @@ const { google } = require('googleapis')
 const CLIENT_ID = 'YOUR_GOOGLE_CLIENT_ID'
 const CLIENT_SECRET = 'YOUR_GOOGLE_CLIENT_SECRET'
 const REDIRECT_URI = 'YOUR_REDIRECT_URI'
+// Gemini API key placeholder (replace with Secret Manager in prod)
+const GEMINI_API_KEY = 'YOUR_GEMINI_API_KEY'
 
 // Run daily at 03:00 UTC
 exports.fetchEmails = functions.pubsub
@@ -89,17 +91,73 @@ exports.fetchEmails = functions.pubsub
           console.log(`User ${uid} - found ${messages.length} messages`) 
 
           for (const msg of messages) {
+
+            // Fetch full message to access body content
             const msgData = await gmail.users.messages.get({
               userId: 'me',
               id: msg.id,
-              format: 'metadata',
-              metadataHeaders: ['Subject', 'From'],
+              format: 'full',
             })
 
+            // Helper to decode base64url text
+            const decodeB64 = (str) =>
+              Buffer.from(str.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8')
+
+            // Recursive function to find plain-text part
+            const getPlainText = (payload) => {
+              if (!payload) return ''
+              if (
+                payload.mimeType === 'text/plain' &&
+                payload.body &&
+                payload.body.data
+              ) {
+                return decodeB64(payload.body.data)
+              }
+              if (payload.parts && payload.parts.length) {
+                for (const p of payload.parts) {
+                  const txt = getPlainText(p)
+                  if (txt) return txt
+                }
+              }
+              return ''
+            }
+
+            const plainText = getPlainText(msgData.data.payload)
+
+            // Extract subject and sender for logging
             const headers = msgData.data.payload.headers
             const subjectHeader = headers.find((h) => h.name === 'Subject') || {}
             const fromHeader = headers.find((h) => h.name === 'From') || {}
-            console.log(`User ${uid} - Email: Subject="${subjectHeader.value}" From="${fromHeader.value}"`)
+
+            console.log(
+              `User ${uid} - Email: Subject="${subjectHeader.value}" From="${fromHeader.value}"`
+            )
+
+            if (!plainText) {
+              console.log(`User ${uid} - No plain text found for message ${msg.id}`)
+              continue
+            }
+
+            // Send to Gemini for structured extraction
+            try {
+              const genAI = new GoogleGenerativeAI(GEMINI_API_KEY)
+              const model = genAI.getGenerativeModel({ model: 'gemini-pro' })
+
+              const prompt = `You are an assistant that extracts subscription details from emails. ` +
+                `Return ONLY valid JSON with the following fields: ` +
+                `serviceName (string), cost (number), billingCycle (string), ` +
+                `nextPaymentDate (ISO 8601 string or null), isTrial (boolean), ` +
+                `trialEndDate (ISO 8601 string or null).\n\n` +
+                `Email:\n${plainText}`
+
+              const gemRes = await model.generateContent(prompt)
+              const parsed = gemRes?.response?.text() || ''
+
+              console.log(`Gemini parsed response for user ${uid}, msg ${msg.id}:`, parsed)
+              // TODO: validate JSON, store into Firestore
+            } catch (aiErr) {
+              console.error(`Gemini parsing failed for user ${uid}, msg ${msg.id}:`, aiErr)
+            }
           }
         } catch (userErr) {
           console.error(`Failed to fetch emails for user ${uid}:`, userErr)
