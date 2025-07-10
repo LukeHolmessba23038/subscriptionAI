@@ -7,9 +7,15 @@
     "dev": "vite",
     "build": "vite build",
     "lint": "eslint .",
+    "format": "prettier --write .",
+    "test": "vitest",
+    "test:watch": "vitest watch",
     "preview": "vite preview"
   },
   "dependencies": {
+    "@google/generative-ai": "^0.24.1",
+    "firebase": "^11.10.0",
+    "googleapis": "^152.0.0",
     "react": "^19.1.0",
     "react-dom": "^19.1.0"
   },
